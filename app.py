@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -30,10 +31,25 @@ def read_csv_flexible(uploaded_file) -> pd.DataFrame:
 def normalize_text(x) -> str:
     if pd.isna(x):
         return ""
-    s = str(x).strip()
+    s = unicodedata.normalize("NFKC", str(x)).strip()
     s = s.replace("　", " ")
     s = re.sub(r"\s+", "", s)
     return s
+
+
+def normalize_race_name(x) -> str:
+    """レース名の表記ゆれ対策。例：天皇賞春 / 天皇賞(春) / 天皇賞（春）を近づける。"""
+    s = normalize_text(x)
+    # グレード表記や余計な記号を軽く除去
+    s = re.sub(r"[()（）［］\[\]・･\s]", "", s)
+    s = s.replace("G1", "").replace("G2", "").replace("G3", "")
+    s = s.replace("GI", "").replace("GII", "").replace("GIII", "")
+    s = s.replace("Jpn1", "").replace("Jpn2", "").replace("Jpn3", "")
+    return s
+
+
+def normalize_horse_name(x) -> str:
+    return normalize_text(x).replace("・", "").replace("･", "")
 
 
 def normalize_r(x) -> str:
@@ -59,19 +75,63 @@ def detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def make_key(df: pd.DataFrame, mapping: Dict[str, Optional[str]], prefix: str) -> pd.Series:
-    parts = []
-    for logical in ["日付", "場所", "R", "レース名", "馬番", "馬名"]:
-        col = mapping.get(logical)
-        if col and col in df.columns:
-            if logical == "R":
-                parts.append(df[col].map(normalize_r))
-            else:
-                parts.append(df[col].map(normalize_text))
-        else:
-            parts.append(pd.Series([""] * len(df), index=df.index))
-    # If 日付/場所/R are missing, still allow レース名+馬番+馬名 matching.
-    return parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4] + "|" + parts[5]
+def _norm_series(df: pd.DataFrame, col: Optional[str], logical: str) -> pd.Series:
+    if not col or col not in df.columns:
+        return pd.Series([""] * len(df), index=df.index)
+    if logical == "R":
+        return df[col].map(normalize_r)
+    if logical == "レース名":
+        return df[col].map(normalize_race_name)
+    if logical == "馬名":
+        return df[col].map(normalize_horse_name)
+    return df[col].map(normalize_text)
+
+
+def make_key_by_fields(df: pd.DataFrame, mapping: Dict[str, Optional[str]], fields: List[str]) -> pd.Series:
+    parts = [_norm_series(df, mapping.get(f), f) for f in fields]
+    if not parts:
+        return pd.Series([""] * len(df), index=df.index)
+    out = parts[0]
+    for p in parts[1:]:
+        out = out + "|" + p
+    return out
+
+
+def choose_best_merge(star_df: pd.DataFrame, straight_df: pd.DataFrame, star_map: Dict[str, Optional[str]], straight_map: Dict[str, Optional[str]]):
+    """表記ゆれに強い順で複数キーを試し、最も結合数が多いものを採用。"""
+    key_patterns = [
+        ("日付＋場所＋R＋レース名＋馬番＋馬名", ["日付", "場所", "R", "レース名", "馬番", "馬名"]),
+        ("日付＋場所＋R＋馬番＋馬名（レース名無視）", ["日付", "場所", "R", "馬番", "馬名"]),
+        ("場所＋R＋馬番＋馬名", ["場所", "R", "馬番", "馬名"]),
+        ("レース名＋馬番＋馬名", ["レース名", "馬番", "馬名"]),
+        ("馬番＋馬名", ["馬番", "馬名"]),
+        ("馬名のみ", ["馬名"]),
+    ]
+
+    best = None
+    best_both = -1
+    best_name = ""
+    best_fields = []
+    debug = []
+
+    for name, fields in key_patterns:
+        s = star_df.copy()
+        d = straight_df.copy()
+        s["__key"] = make_key_by_fields(s, star_map, fields)
+        d["__key"] = make_key_by_fields(d, straight_map, fields)
+        # 空キーだらけの結合は事故るので除外
+        s_nonempty = s[s["__key"].astype(str).str.replace("|", "", regex=False).str.len() > 0].copy()
+        d_nonempty = d[d["__key"].astype(str).str.replace("|", "", regex=False).str.len() > 0].copy()
+        merged_try = s_nonempty.merge(d_nonempty, on="__key", how="outer", suffixes=("_重賞", "_直線"), indicator=True)
+        both = int(merged_try["_merge"].eq("both").sum())
+        debug.append({"使用キー候補": name, "結合行数": both, "重賞側キー数": s_nonempty["__key"].nunique(), "直線側キー数": d_nonempty["__key"].nunique()})
+        if both > best_both:
+            best = merged_try
+            best_both = both
+            best_name = name
+            best_fields = fields
+
+    return best, best_name, pd.DataFrame(debug), best_fields
 
 
 def to_num(s):
@@ -213,7 +273,7 @@ with st.sidebar:
     star_file = st.file_uploader("① 重賞⭐️フィルターアプリの結果CSV", type=["csv"], key="star")
     straight_file = st.file_uploader("② 直線ロジックアプリの結果CSV", type=["csv"], key="straight")
     st.divider()
-    st.caption("結合キーは基本：日付＋場所＋R＋レース名＋馬番＋馬名。列が無い場合はある列だけで補助結合します。")
+    st.caption("結合キーは複数パターンを自動比較します。レース名表記ゆれがあっても、馬番＋馬名などで補助結合します。")
 
 star_df = read_csv_flexible(star_file) if star_file else pd.DataFrame()
 straight_df = read_csv_flexible(straight_file) if straight_file else pd.DataFrame()
@@ -271,37 +331,10 @@ with st.expander("2. 列の自動判定・手動修正", expanded=False):
             default = options.index(straight_map[k]) if straight_map[k] in options else 0
             straight_map[k] = st.selectbox(f"直線CSV：{k}", options, index=default, key=f"straight_{k}")
 
-# Add keys
+# 表記ゆれに強い複数キーで結合
 star_df = star_df.copy()
 straight_df = straight_df.copy()
-star_df["__key"] = make_key(star_df, star_map, "star")
-straight_df["__key"] = make_key(straight_df, straight_map, "straight")
-
-# Try full key merge, but if low match, try fallback keys
-merged = star_df.merge(straight_df, on="__key", how="outer", suffixes=("_重賞", "_直線"), indicator=True)
-match_rate = (merged["_merge"].eq("both").sum() / max(len(merged), 1))
-
-if match_rate < 0.5:
-    # fallback レース名+馬番+馬名
-    def fallback_key(df, mp):
-        parts = []
-        for logical in ["レース名", "馬番", "馬名"]:
-            col = mp.get(logical)
-            if col and col in df.columns:
-                parts.append(df[col].map(normalize_text))
-            else:
-                parts.append(pd.Series([""] * len(df), index=df.index))
-        return parts[0] + "|" + parts[1] + "|" + parts[2]
-    star_df["__key2"] = fallback_key(star_df, star_map)
-    straight_df["__key2"] = fallback_key(straight_df, straight_map)
-    merged2 = star_df.merge(straight_df, on="__key2", how="outer", suffixes=("_重賞", "_直線"), indicator=True)
-    if merged2["_merge"].eq("both").sum() > merged["_merge"].eq("both").sum():
-        merged = merged2
-        key_used = "レース名＋馬番＋馬名"
-    else:
-        key_used = "日付＋場所＋R＋レース名＋馬番＋馬名"
-else:
-    key_used = "日付＋場所＋R＋レース名＋馬番＋馬名"
+merged, key_used, merge_debug_df, key_fields = choose_best_merge(star_df, straight_df, star_map, straight_map)
 
 st.subheader("3. 結合結果")
 mc1, mc2, mc3 = st.columns(3)
@@ -309,6 +342,9 @@ mc1.metric("結合できた行", int(merged["_merge"].eq("both").sum()))
 mc2.metric("重賞CSVのみ", int(merged["_merge"].eq("left_only").sum()))
 mc3.metric("直線CSVのみ", int(merged["_merge"].eq("right_only").sum()))
 st.caption(f"使用キー：{key_used}")
+with st.expander("結合キー候補別の結果", expanded=False):
+    st.dataframe(merge_debug_df, use_container_width=True, hide_index=True)
+    st.caption("結合できた行が0の場合は、2.列の自動判定・手動修正で『馬番』『馬名』『レース名』の対応列を確認してください。")
 
 # Compose output rows from merged both primarily, but include unmatched too
 out = pd.DataFrame()
